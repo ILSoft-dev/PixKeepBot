@@ -1,8 +1,49 @@
 """
 main.py
-v5.5 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.7 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.7: replaced the two separate, uncoordinated batch-collection mechanisms
+        (one waiting a flat 1s for an album's remaining media_group_id
+        messages, one debouncing individually-sent files with no
+        media_group_id) with a single per-chat buffer + one silence timer
+        (BATCH_SILENCE_SECONDS, still 4.0s). Every incoming photo/document
+        for a chat — album or not, whichever album — now goes into the same
+        list and resets the same timer; processing starts once nothing new
+        has arrived for BATCH_SILENCE_SECONDS. This is the real fix for the
+        "Получил 2 файл(ов)" / "Получил 9 файл(ов)" double-prompt: Telegram
+        caps albums at 10 items, so sending 11 photos gets split client-side
+        into a 10-item and a 1-item media group with two different
+        media_group_id values, arriving moments apart — the old code had no
+        way to know they were part of the same user action and processed
+        them as two unrelated batches. Now, as long as the split pieces
+        arrive within the same silence window (which they normally do,
+        being one client-side send), they're collected and processed
+        together as a single batch with a single folder-name question.
+        folder_name_queue (v5.6) and chat_locks (v5.5) are both kept as
+        fallbacks — they still matter if a burst is large/slow enough to
+        genuinely produce two separate silence windows.
+- v5.6: fixed a second, separate bug behind the same symptom as v5.5's
+        "10 + 1" case: Telegram itself splits any send of 11+ photos into
+        separate media groups (a hard 10-item album cap, nothing this bot
+        can do about that) — so with auto_date_folder OFF, both batches'
+        _process() calls reached the manual "укажите имя папки" prompt in
+        quick succession. That prompt stores its batch's items/work_dir in
+        FSM state and waits for a text reply — but FSM state is per chat,
+        not per batch, so the second batch's state.update_data() silently
+        overwrote the first batch's before its question could be answered:
+        whichever name got typed only applied to the last batch, and the
+        earlier one's downloaded files were orphaned (never uploaded, temp
+        dir never cleaned up). Two "Укажите имя папки" prompts appearing
+        back-to-back, before there was time to answer either, was the
+        visible symptom. Fixed with a small per-chat queue
+        (folder_name_queue): if a batch reaches the manual-name prompt while
+        another one is already waiting on FSM state, it's queued instead of
+        overwriting that state, and gets its own prompt once the batch ahead
+        of it is answered (on_folder_name) or cancelled (on_cancel) — both
+        now run under the same chat_locks lock from v5.5, so a newly
+        arriving batch's _process() can't check-and-overwrite FSM state in
+        the middle of that handoff either.
 - v5.5: fixed a batch-splitting/duplicate-folder bug: a burst of ~10+ files
         sent close together (esp. over a slow/unstable connection) could get
         chopped into several smaller batches — either because the singles
@@ -111,7 +152,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.5"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.7"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import logging
@@ -176,34 +217,39 @@ class IsAdmin(BaseFilter):
 dp.message.filter(IsAdmin())
 dp.callback_query.filter(IsAdmin())
 
-media_groups: dict[str, list[Message]] = {}
-media_group_tasks: dict[str, asyncio.Task] = {}
-
-# Some Telegram clients send multi-file uploads (esp. "as file"/document)
-# as several separate messages WITHOUT a shared media_group_id, instead of
-# a real album. To still treat them as one batch, we buffer such messages
-# per chat and debounce: each new arrival resets the wait timer, and only
-# once SINGLES_DEBOUNCE_SECONDS pass with no new file do we process the batch.
-# Raised from 2.0 in v5.5 — on a slow/unstable connection a >2s gap between
-# individually-arriving files was common enough to split one burst into
-# several batches (see chat_locks below for why that used to also create
-# duplicate Drive folders).
-SINGLES_DEBOUNCE_SECONDS = 4.0
-pending_singles: dict[int, list[Message]] = {}
-pending_singles_tasks: dict[int, asyncio.Task] = {}
+# v5.7: single per-chat buffer for an entire incoming burst — replaces two
+# separate, uncoordinated mechanisms that used to exist here (one that
+# waited a flat 1s for an album's remaining media_group_id messages, one
+# that debounced individually-sent files with no media_group_id). Telegram
+# caps any single album at 10 items, so sending 11+ photos gets split
+# client-side into two media groups with two different media_group_id
+# values — the old code treated those as two unrelated batches with no
+# knowledge of each other, which is what produced the "Получил 2 файл(ов)"
+# / "Получил 9 файл(ов)" double-prompt. Now it doesn't matter whether an
+# arriving file belongs to an album, a different album, or no album at
+# all: every arrival goes into the same list for its chat and resets the
+# same silence timer. Processing starts once nothing new has arrived for
+# BATCH_SILENCE_SECONDS, so a 10+1 split (or any burst) that lands within
+# that window is naturally collected and processed as one batch with one
+# folder-name question, instead of relying on the queue (folder_name_queue,
+# still kept below as a fallback for genuinely separate sends) to sort out
+# two competing prompts after the fact.
+BATCH_SILENCE_SECONDS = 4.0
+pending_batch: dict[int, list[Message]] = {}
+pending_batch_tasks: dict[int, asyncio.Task] = {}
 
 # v5.5: serializes batch processing per chat. Without this, two batches for
-# the same chat (e.g. a burst split by the singles debounce into two pieces,
-# or a media-group album landing right alongside a loose-files burst) could
-# run _process()/_do_upload() concurrently. Both would then call
-# ensure_folder() for the same auto-date folder name at nearly the same
-# time — both search Drive, both find nothing (neither has created it yet),
-# both create a folder — leaving two duplicate "31.08.26"-style folders with
-# only some of the files in each, instead of one folder with all of them.
-# Holding this lock for the full duration of _process() (through upload,
-# report, and cleanup) means a later batch's ensure_folder() call always
-# runs after the earlier batch's folder-create has already committed, so it
-# finds and reuses that folder instead of racing to make a new one.
+# the same chat (e.g. a burst split by the silence timer into two pieces,
+# which can still happen if the pauses are long enough) could run
+# _process()/_do_upload() concurrently. Both would then call ensure_folder()
+# for the same auto-date folder name at nearly the same time — both search
+# Drive, both find nothing (neither has created it yet), both create a
+# folder — leaving two duplicate "31.08.26"-style folders with only some of
+# the files in each, instead of one folder with all of them. Holding this
+# lock for the full duration of _process() (through upload, report, and
+# cleanup) means a later batch's ensure_folder() call always runs after the
+# earlier batch's folder-create has already committed, so it finds and
+# reuses that folder instead of racing to make a new one.
 chat_locks: dict[int, asyncio.Lock] = {}
 
 
@@ -382,46 +428,29 @@ async def handle_media(message: Message, state: FSMContext):
         await message.answer("Сначала подключи Google Drive командой /start.")
         return
 
-    if message.media_group_id:
-        gid = message.media_group_id
-        media_groups.setdefault(gid, []).append(message)
-        if gid not in media_group_tasks:
-            media_group_tasks[gid] = asyncio.create_task(
-                _finish_group(gid, state, message.chat.id)
-            )
-    else:
-        chat_id = message.chat.id
-        pending_singles.setdefault(chat_id, []).append(message)
-        # Cancel any previously scheduled flush for this chat and reschedule —
-        # this is what lets a burst of individually-sent files get grouped.
-        old_task = pending_singles_tasks.get(chat_id)
-        if old_task and not old_task.done():
-            old_task.cancel()
-        pending_singles_tasks[chat_id] = asyncio.create_task(
-            _finish_singles(chat_id, state)
-        )
+    chat_id = message.chat.id
+    pending_batch.setdefault(chat_id, []).append(message)
+    # Cancel any previously scheduled flush for this chat and reschedule —
+    # this is what lets an entire burst (any mix of albums and loose files)
+    # get collected as one batch instead of processed piecemeal.
+    old_task = pending_batch_tasks.get(chat_id)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    pending_batch_tasks[chat_id] = asyncio.create_task(
+        _finish_batch(chat_id, state)
+    )
 
 
-async def _finish_singles(chat_id: int, state: FSMContext):
+async def _finish_batch(chat_id: int, state: FSMContext):
     try:
-        await asyncio.sleep(SINGLES_DEBOUNCE_SECONDS)
+        await asyncio.sleep(BATCH_SILENCE_SECONDS)
     except asyncio.CancelledError:
         return  # a newer file arrived and rescheduled us; that task will run
-    messages = pending_singles.pop(chat_id, [])
-    pending_singles_tasks.pop(chat_id, None)
+    messages = pending_batch.pop(chat_id, [])
+    pending_batch_tasks.pop(chat_id, None)
     if messages:
-        # Wait for any batch already in flight for this chat (e.g. an album
-        # that arrived at nearly the same time) to fully finish first — see
-        # chat_locks above for why this matters.
-        async with _get_chat_lock(chat_id):
-            await _process(messages, state, chat_id)
-
-
-async def _finish_group(gid: str, state: FSMContext, chat_id: int):
-    await asyncio.sleep(1.0)
-    messages = media_groups.pop(gid, [])
-    media_group_tasks.pop(gid, None)
-    if messages:
+        # Wait for any batch already in flight for this chat to fully finish
+        # first — see chat_locks above for why this matters.
         async with _get_chat_lock(chat_id):
             await _process(messages, state, chat_id)
 
@@ -568,6 +597,41 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
         await _do_upload(chat_id, telegram_id, items, work_dir, folder_name)
         return
 
+    # v5.6: FSM state (waiting_folder_name + its items/work_dir) is per chat,
+    # not per batch. If a previous batch is already waiting on a folder-name
+    # answer (e.g. Telegram split one 11-file send into a 10-file and a
+    # 1-file media group — see the 10+1 report — and this is the second one
+    # arriving right behind the first), setting state here would silently
+    # overwrite the first batch's items/work_dir: whatever name gets typed
+    # would only apply to the last batch, and the earlier one's files would
+    # never upload and never get cleaned up. Queue it instead — it gets its
+    # own prompt once the batch ahead of it is answered.
+    current_fsm_state = await state.get_state()
+    if current_fsm_state == Flow.waiting_folder_name.state:
+        folder_name_queue.setdefault(chat_id, []).append({"items": items, "work_dir": work_dir, "note": note})
+        await bot.send_message(
+            chat_id,
+            note + "\n\n⏳ Уже жду имя папки для предыдущей пачки — сначала "
+                   "ответь на тот вопрос, потом спрошу про эту.",
+        )
+        return
+
+    await _ask_folder_name(chat_id, state, items, work_dir, note)
+
+
+# v5.6: queue of batches waiting for their turn to ask "укажите имя папки",
+# used when more than one batch is in flight for the same chat at once (see
+# the comment in _process above). Keyed by chat_id; each entry is the same
+# {"items", "work_dir", "note"} shape _process would otherwise put straight
+# into FSM state.
+folder_name_queue: dict[int, list[dict]] = {}
+
+
+async def _ask_folder_name(chat_id: int, state: FSMContext, items: list[dict],
+                            work_dir: str, note: str) -> None:
+    """Puts one batch into Flow.waiting_folder_name and sends its prompt.
+    Shared by _process (first batch for a chat) and _ask_next_queued (any
+    batch that had to wait behind it)."""
     await state.update_data(items=items, work_dir=work_dir)
     await state.set_state(Flow.waiting_folder_name)
 
@@ -578,11 +642,25 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     await bot.send_message(chat_id, note, reply_markup=cancel_kb)
 
 
+async def _ask_next_queued(chat_id: int, state: FSMContext) -> None:
+    """Called once a batch's folder-name question has been resolved (answered
+    or cancelled) — pops the next queued batch for this chat, if any, and
+    asks its folder-name question."""
+    queue = folder_name_queue.get(chat_id)
+    if not queue:
+        return
+    nxt = queue.pop(0)
+    if not queue:
+        folder_name_queue.pop(chat_id, None)
+    await _ask_folder_name(chat_id, state, nxt["items"], nxt["work_dir"], nxt["note"])
+
+
 # ------------------------------------------------------------------ cancel ---
 @dp.callback_query(F.data == "cancel")
 async def on_cancel(cq: CallbackQuery, state: FSMContext):
     """Wipes downloaded/cleaned temp files and clears FSM state without
     uploading anything."""
+    chat_id = cq.message.chat.id
     data = await state.get_data()
     work_dir = data.get("work_dir")
     if work_dir and os.path.exists(work_dir):
@@ -590,6 +668,10 @@ async def on_cancel(cq: CallbackQuery, state: FSMContext):
     await state.clear()
     await cq.message.edit_text("❌ Отменено. Ничего не загружено, временные файлы удалены.")
     await cq.answer("Отменено")
+    # v5.6: if another batch was queued behind this one (see folder_name_queue),
+    # its turn to ask for a folder name is now — cancelling shouldn't strand it.
+    async with _get_chat_lock(chat_id):
+        await _ask_next_queued(chat_id, state)
 
 
 # ------------------------------------------------------------ folder + up ----
@@ -731,6 +813,7 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
 
 @dp.message(Flow.waiting_folder_name, F.text)
 async def on_folder_name(message: Message, state: FSMContext):
+    chat_id = message.chat.id
     data = await state.get_data()
     items = data.get("items", [])
     work_dir = data.get("work_dir")
@@ -742,7 +825,13 @@ async def on_folder_name(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await _do_upload(message.chat.id, message.from_user.id, items, work_dir, folder_name)
+    # v5.6: hold the same per-chat lock _process uses, so a batch that's
+    # still queued (waiting for THIS answer to free things up) can't get
+    # its own prompt asked out of turn, and so this upload's ensure_folder()
+    # call can't race a concurrently-arriving new batch's.
+    async with _get_chat_lock(chat_id):
+        await _do_upload(chat_id, message.from_user.id, items, work_dir, folder_name)
+        await _ask_next_queued(chat_id, state)
 
 
 # ------------------------------------------------------- oauth web server ----

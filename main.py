@@ -1,8 +1,41 @@
 """
 main.py
-v5.9 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.11 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.11: moved the "still working" indicator (v5.9) out of the chat log and
+        into Telegram's native chat-action line — the "бот отправляет
+        файл..." text that shows right under the chat title, the same spot
+        Telegram's own service notices ("Connecting...") show up. v5.9 sent
+        random filler text messages into the conversation itself to prove
+        the bot hadn't stalled; those are gone now in favor of
+        bot.send_chat_action, re-sent every 4s (a chat action only holds
+        for ~5s before Telegram clears it) for as long as the wrapped work
+        runs, then left to disappear on its own — nothing to clean up.
+        Same two spots as before (download+exif+clean in _process, the
+        Drive upload in _do_upload), just a different action type per spot
+        since Bot API's fixed action vocabulary has no generic "processing"
+        option: TYPING for the first, UPLOAD_DOCUMENT (the default) for the
+        second.
+- v5.10: added a "♻️ Заменять файлы с таким же именем" setting
+        (replace_duplicates, /settings — off by default, so nobody's
+        existing behavior changes unless they opt in). Google Drive treats
+        filenames as plain metadata, not a unique path — uploading a file
+        called IMG_1234.jpg into a folder that already has one just creates
+        a second object with the same name, no error, no warning. With this
+        on, upload now checks the target folder for a file with that exact
+        name first (find_file_in_folder) and overwrites its content in
+        place (replace_file_content) instead of creating a duplicate —
+        same file id, same share link. Matching is by name only within the
+        target folder, not by content hash, so this is specifically for
+        "I re-sent the same file/named it the same" rather than true
+        content-dedup.
+        REQUIRES a Supabase migration before deploying — see db.py's
+        header (ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS
+        replace_duplicates boolean default false;) — get_settings() builds
+        its SELECT from DEFAULT_SETTINGS.keys(), so without that column
+        every call (including the one behind every single upload) errors
+        out until the migration runs.
 - v5.9: added a "heartbeat" — a background ping every 6s with a random
         working-on-it phrase (see HEARTBEAT_MESSAGES) — wrapped around the
         two stretches of the pipeline that can run long with literally
@@ -171,13 +204,12 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.9"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.11"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
 import logging
 import os
-import random
 import shutil
 import uuid
 from collections import Counter
@@ -187,6 +219,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ChatAction
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -215,6 +248,8 @@ from exif_utils import inspect_metadata, strip_exif
 from drive_utils import (
     ensure_folder,
     upload_file,
+    find_file_in_folder,
+    replace_file_content,
     publish_and_get_url,
     GoogleAuthError,
 )
@@ -283,47 +318,51 @@ def _get_chat_lock(chat_id: int) -> asyncio.Lock:
     return lock
 
 
-# v5.9: the chat goes quiet for the entire download+exif+clean stretch (right
-# after the "укажите имя папки"/auto-date note — those only get sent once
-# all of that has already finished) and again during the actual Drive
-# upload — both can take a while for a big batch, and with nothing printed
-# in between it's not obvious the bot is still doing anything rather than
-# stuck. This isn't meant to narrate the real step (that's what the
-# "Получил N файлов" / "Загружаю в папку..." messages already do) — it's
-# just proof of life, so the messages don't need to match what's actually
-# executing at that instant.
-HEARTBEAT_INTERVAL_SECONDS = 6.0
-HEARTBEAT_MESSAGES = [
-    "⚙️ Работаю, не отключайся...",
-    "📥 Разбираю файлы...",
-    "🧹 Копаюсь в метаданных...",
-    "📤 Ещё немного...",
-    "🔍 Почти готово...",
-    "⏳ Секунду...",
-]
+# v5.11: v5.9's heartbeat sent random filler text messages into the chat
+# itself to prove the bot was still alive during the two long-silent
+# stretches (download+exif+clean in _process, the actual Drive upload in
+# _do_upload). Replaced with Telegram's native chat-action indicator — the
+# same "печатает..." / "отправляет файл..." line that appears right under
+# the chat title, which is also where Telegram's own service notices (e.g.
+# "Connecting...") show up. It's more at home there than as extra messages
+# cluttering the conversation, and needs no cleanup — nothing to delete
+# once the real work is done, it just stops updating and Telegram clears
+# it on its own a few seconds later.
+#
+# A sendChatAction call only keeps the indicator showing for ~5s, so it
+# has to be re-sent periodically for the duration of a long operation —
+# same repeating-background-task shape as the old heartbeat, just calling
+# send_chat_action instead of send_message. Bot API only offers a fixed
+# set of action types (no custom text), so exact wording isn't ours to
+# pick — "upload_document" for the download/inspect/clean stretch (closest
+# available match to "handling files") and "upload_document" again for the
+# actual Drive upload right after.
+CHAT_ACTION_INTERVAL_SECONDS = 4.0
 
 
-async def _heartbeat_loop(chat_id: int) -> None:
+async def _chat_action_loop(chat_id: int, action: str) -> None:
     try:
         while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-            await bot.send_message(chat_id, random.choice(HEARTBEAT_MESSAGES))
+            await bot.send_chat_action(chat_id, action)
+            await asyncio.sleep(CHAT_ACTION_INTERVAL_SECONDS)
     except asyncio.CancelledError:
         pass
 
 
 @contextlib.asynccontextmanager
-async def _heartbeat(chat_id: int):
-    """Wrap around any await that might run long and silent. Starts a
-    background task pinging the chat every HEARTBEAT_INTERVAL_SECONDS;
-    always cancelled on the way out, success or failure alike."""
-    task = asyncio.create_task(_heartbeat_loop(chat_id))
+async def _heartbeat(chat_id: int, action: str = ChatAction.UPLOAD_DOCUMENT):
+    """Wrap around any await that might run long and silent. Keeps
+    Telegram's own "бот отправляет файл..." indicator alive under the chat
+    title for as long as the wrapped code runs; always stopped on the way
+    out, success or failure alike."""
+    task = asyncio.create_task(_chat_action_loop(chat_id, action))
     try:
         yield
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
 
 
 class Flow(StatesGroup):
@@ -427,6 +466,7 @@ def _settings_keyboard(s: dict) -> InlineKeyboardMarkup:
     clean_mark = "✅" if s["clean_metadata"] else "⬜"
     rename_mark = "✅" if s["anonymize_names"] else "⬜"
     date_mark = "✅" if s["auto_date_folder"] else "⬜"
+    replace_mark = "✅" if s["replace_duplicates"] else "⬜"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=f"{clean_mark} Чистить метаданные (EXIF/GPS)",
@@ -439,6 +479,10 @@ def _settings_keyboard(s: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             text=f"{date_mark} Папка по дате съёмки (без вопроса)",
             callback_data="toggle:auto_date_folder",
+        )],
+        [InlineKeyboardButton(
+            text=f"{replace_mark} Заменять файлы с таким же именем",
+            callback_data="toggle:replace_duplicates",
         )],
     ])
 
@@ -610,7 +654,11 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     # v5.9: this is the long silent stretch — download from Telegram, run
     # exiftool on every file, optionally re-write clean copies — with
     # nothing printed to the chat until it's all done. Heartbeat covers it.
-    async with _heartbeat(chat_id):
+    # v5.11: TYPING here specifically (vs. the default UPLOAD_DOCUMENT used
+    # for the Drive upload below in _do_upload) purely so the indicator
+    # differs between the two stretches — Bot API has no generic
+    # "processing" action to reach for.
+    async with _heartbeat(chat_id, action=ChatAction.TYPING):
         paths = await asyncio.gather(*[_download_bounded(msg) for msg in messages])
 
         items = []
@@ -656,6 +704,8 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
         f"Имена: {'обезличиваю (001, 002…)' if settings['anonymize_names'] else 'оставляю оригинальные'}. "
         "(меняется в /settings)"
     )
+    if settings["replace_duplicates"]:
+        note += "\n♻️ Файлы с таким же именем в папке будут заменены."
 
     if settings["auto_date_folder"]:
         folder_name = _pick_folder_date(exif_dates, messages).strftime("%d.%m.%y")
@@ -745,8 +795,8 @@ async def on_cancel(cq: CallbackQuery, state: FSMContext):
 UPLOAD_CONCURRENCY = 4
 
 
-async def _upload_all(account: dict, items: list[dict],
-                      folder_name: str) -> tuple[list[dict], str]:
+async def _upload_all(account: dict, items: list[dict], folder_name: str,
+                      replace_duplicates: bool = False) -> tuple[list[dict], str]:
     """Upload every item to the user's Google Drive folder, concurrently
     (bounded by UPLOAD_CONCURRENCY). Continues past individual file
     failures (records them, doesn't abort).
@@ -759,6 +809,11 @@ async def _upload_all(account: dict, items: list[dict],
     time (only the first actually calls Google; the rest just wait for it
     and reuse the refreshed token) — and only the items that actually hit
     the 401 get retried; everything already uploaded stays untouched.
+
+    replace_duplicates (settings, v5.10): when True, a file whose name
+    already exists in this folder gets its content overwritten in place
+    (same file id, same share link) instead of a second copy being
+    created alongside it — see find_file_in_folder/replace_file_content.
     """
     folder_name = folder_name.strip()  # Drive folder names are plain metadata,
                                         # not a path, so no slash-stripping needed
@@ -787,13 +842,26 @@ async def _upload_all(account: dict, items: list[dict],
             access_token = await refresh_once()
             folder_id = await ensure_folder(session, access_token, folder_name)
 
+        async def _put_one(token: str, it: dict) -> None:
+            """Does the actual create-or-replace for one item, given a
+            known-good token. Raises on failure so both call sites below
+            (first try / after-refresh retry) can handle it the same way."""
+            existing_id = None
+            if replace_duplicates:
+                existing_id = await find_file_in_folder(
+                    session, token, folder_id, it["upload_name"]
+                )
+            if existing_id:
+                await replace_file_content(session, token, it["upload_path"], existing_id)
+            else:
+                await upload_file(
+                    session, token, it["upload_path"], folder_id, it["upload_name"],
+                )
+
         async def _upload_one(index: int, it: dict) -> None:
             async with sem:
                 try:
-                    await upload_file(
-                        session, access_token, it["upload_path"],
-                        folder_id, it["upload_name"],
-                    )
+                    await _put_one(access_token, it)
                     results[index] = {**it, "success": True, "error": None}
                     return
                 except GoogleAuthError:
@@ -805,10 +873,7 @@ async def _upload_all(account: dict, items: list[dict],
 
                 try:
                     token = await refresh_once()
-                    await upload_file(
-                        session, token, it["upload_path"],
-                        folder_id, it["upload_name"],
-                    )
+                    await _put_one(token, it)
                     results[index] = {**it, "success": True, "error": None}
                 except Exception as e:
                     logging.error(f"upload failed for {it['upload_name']} after refresh: {e}")
@@ -834,9 +899,10 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
 
     await bot.send_message(chat_id, f"Загружаю в папку «{folder_name}»...")
 
+    replace_duplicates = get_settings(telegram_id)["replace_duplicates"]
     try:
         async with _heartbeat(chat_id):
-            results, link = await _upload_all(account, items, folder_name)
+            results, link = await _upload_all(account, items, folder_name, replace_duplicates)
     except Exception as e:
         logging.exception("upload failed")
         await bot.send_message(chat_id, f"Ошибка при загрузке: {e}")

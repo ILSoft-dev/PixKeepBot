@@ -74,7 +74,8 @@ create table if not exists user_settings (
   telegram_id bigint primary key,
   clean_metadata boolean default true,
   anonymize_names boolean default false,
-  auto_date_folder boolean default false
+  auto_date_folder boolean default false,
+  replace_duplicates boolean default false
 );
 
 create table if not exists google_accounts (
@@ -88,6 +89,14 @@ create table if not exists google_accounts (
   unique (telegram_id, email)
 );
 create index if not exists idx_google_accounts_telegram on google_accounts(telegram_id);
+```
+
+**Если у тебя уже есть `user_settings` без колонки `replace_duplicates`**
+(т.е. обновляешься на v5.10) — обязательно добавь её ДО деплоя новой версии
+кода, иначе сломаются вообще все загрузки (не только новая настройка):
+```sql
+alter table user_settings
+  add column if not exists replace_duplicates boolean default false;
 ```
 
 **Если у тебя уже есть `user_settings` без колонки `auto_date_folder`** —

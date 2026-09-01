@@ -1,12 +1,19 @@
 """
 drive_utils.py
-v4.0 - Google Drive v3 REST API helpers (async, aiohttp, no Google client libs)
+v4.1 - Google Drive v3 REST API helpers (async, aiohttp, no Google client libs)
 
 Mirrors the shape of the previous Yandex disk_utils.py so main.py's overall
 flow barely has to change: ensure_folder / upload_file / publish_and_get_url.
 
 API docs: https://developers.google.com/workspace/drive/api/reference/rest/v3
 Auth header format: `Authorization: Bearer <token>`.
+
+Changelog:
+- v4.1: added find_file_in_folder + replace_file_content, for the
+        replace_duplicates setting — lets main.py overwrite an existing
+        same-named file in place instead of always creating a new one via
+        upload_file (Drive's default: filenames aren't unique, so uploading
+        the same file twice used to just leave two copies behind).
 """
 import json
 
@@ -68,7 +75,10 @@ async def ensure_folder(session: aiohttp.ClientSession, token: str,
 
 async def upload_file(session: aiohttp.ClientSession, token: str,
                       local_path: str, folder_id: str, name: str) -> None:
-    """Multipart upload of a single (modest-size) file into folder_id."""
+    """Multipart upload of a single (modest-size) file into folder_id.
+    Always creates a NEW file, even if one with this name already exists
+    in folder_id — see find_file_in_folder/replace_file_content below for
+    the "don't duplicate" alternative (the replace_duplicates setting)."""
     metadata = {"name": name, "parents": [folder_id]}
     with open(local_path, "rb") as f:
         file_bytes = f.read()
@@ -85,6 +95,42 @@ async def upload_file(session: aiohttp.ClientSession, token: str,
         data=form, headers=_headers(token),
     ) as resp:
         await _check(resp, ok=(200, 201))
+
+
+async def find_file_in_folder(session: aiohttp.ClientSession, token: str,
+                              folder_id: str, name: str) -> str | None:
+    """Looks for a non-trashed file named exactly `name` directly inside
+    folder_id. Returns its file id, or None if there isn't one.
+
+    Used by the replace_duplicates setting. Same drive.file-scope caveat as
+    ensure_folder: this can only see files the app itself created — which is
+    exactly the set we'd want to compare against anyway, since "the same
+    file sent again" only makes sense relative to what this bot put there.
+    """
+    safe_name = name.replace("'", "\\'")
+    query = f"'{folder_id}' in parents and name='{safe_name}' and trashed=false"
+    async with session.get(
+        f"{API}/files", params={"q": query, "fields": "files(id)"},
+        headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
+        data = await resp.json()
+    files = data.get("files", [])
+    return files[0]["id"] if files else None
+
+
+async def replace_file_content(session: aiohttp.ClientSession, token: str,
+                               local_path: str, file_id: str) -> None:
+    """Overwrites an existing file's bytes in place — same file id, same
+    share link, no duplicate. Used instead of upload_file when
+    find_file_in_folder found a same-named file already there."""
+    with open(local_path, "rb") as f:
+        file_bytes = f.read()
+    async with session.patch(
+        f"{UPLOAD_API}/files/{file_id}", params={"uploadType": "media"},
+        data=file_bytes, headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
 
 
 async def publish_and_get_url(session: aiohttp.ClientSession, token: str,

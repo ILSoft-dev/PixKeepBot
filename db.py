@@ -1,12 +1,13 @@
 """
 db.py
-v5.2 - multiple Google accounts per Telegram user + standing settings, in Supabase
+v5.3 - multiple Google accounts per Telegram user + standing settings, in Supabase
 
 Tables (create once, SQL in README):
     user_settings(telegram_id bigint primary key,
                   clean_metadata boolean default true,
                   anonymize_names boolean default false,
-                  auto_date_folder boolean default false)
+                  auto_date_folder boolean default false,
+                  replace_duplicates boolean default false)
 
     google_accounts(id bigserial primary key,
                     telegram_id bigint not null,
@@ -18,6 +19,14 @@ Tables (create once, SQL in README):
                     unique (telegram_id, email))
 
 Changelog:
+- v5.3: added replace_duplicates setting — when on, uploading a file whose
+        name already exists in the target Drive folder overwrites that
+        file in place instead of leaving a second copy with the same name
+        (Drive's default, since filenames there are just metadata, not a
+        unique path). Off by default: matches the bot's existing behavior
+        for everyone until they opt in.
+        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS
+        replace_duplicates boolean default false;
 - v5.2: BUGFIX — get_settings() was still SELECTing only the original two
         columns, so auto_date_folder (added in v5.1) never actually came
         back from Supabase; it silently fell back to its default every
@@ -43,6 +52,7 @@ DEFAULT_SETTINGS = {
     "clean_metadata": True,
     "anonymize_names": False,
     "auto_date_folder": False,
+    "replace_duplicates": False,
 }
 
 

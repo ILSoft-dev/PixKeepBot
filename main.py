@@ -1,8 +1,16 @@
 """
 main.py
-v5.12 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.13 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.13: removed the TYPING chat-action v5.12 wrapped around message
+        deletion. There's no "done" chat-action to end on (Bot API's
+        action vocabulary is entirely in-progress states — typing,
+        uploading, recording, etc. — nothing means "finished"), so all it
+        actually did was flash "печатает..." right after the upload report
+        and then silently stop, which read as unfinished rather than
+        reassuring. Deletion runs plainly now; the upload report is simply
+        the last thing in the chat, nothing flickers after it.
 - v5.12: the upload flow used to always end with a routine "🗑 Удалил N
         исходных сообщений из чата" text message AFTER the "✅ Загружено...
         ссылка" report — so the link/report was never actually the last
@@ -215,7 +223,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.12"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.13"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -949,20 +957,21 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
 
     # Delete original chat messages only for files that actually uploaded.
-    # v5.12: this used to always end with its own "🗑 Удалил N исходных
-    # сообщений" text message — meaning the link/report above was never
-    # actually the last thing in the chat, a routine housekeeping note
-    # always came after it. Deletion itself is quick, but wrapping it in
-    # the same chat-action indicator as the rest of the pipeline still
-    # gives *some* visible sign it's happening, without adding a message.
+    # v5.13: v5.12 wrapped this in the TYPING chat-action to give some sign
+    # it was happening. But there's no "done" chat-action to follow it with
+    # (Bot API's action vocabulary is a fixed set of in-progress states,
+    # nothing means "finished") — so all that flash of "печатает..." right
+    # at the end actually accomplished was raising "why did it say typing
+    # and then nothing?". Deletion is quick regardless; doing it plainly
+    # here means the upload report above is simply the last thing in the
+    # chat, full stop, with nothing flickering after it.
     not_deleted = 0
-    async with _heartbeat(chat_id, action=ChatAction.TYPING):
-        for r in succeeded:
-            try:
-                await bot.delete_message(chat_id, r["message_id"])
-            except Exception as e:
-                logging.warning(f"couldn't delete message {r['message_id']}: {e}")
-                not_deleted += 1
+    for r in succeeded:
+        try:
+            await bot.delete_message(chat_id, r["message_id"])
+        except Exception as e:
+            logging.warning(f"couldn't delete message {r['message_id']}: {e}")
+            not_deleted += 1
 
     # Only speak up here if something actually needs attention (a handful
     # of messages Telegram wouldn't let us delete, e.g. too old) — that's

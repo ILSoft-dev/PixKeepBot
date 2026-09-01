@@ -1,8 +1,15 @@
 """
 main.py
-v5.7 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.8 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.8: added a "📋 Скопировать ссылку" button under the final upload report,
+        using Telegram's copy_text inline-button type (Bot API 7.x+,
+        aiogram's CopyTextButton) — tapping it puts the Drive link straight
+        on the clipboard. The link in the message text is still a normal
+        tappable URL that opens the folder; this is purely additive, since
+        Telegram gives a plain URL exactly one tap behavior (open) and
+        there's no way to make that same tap also copy.
 - v5.7: replaced the two separate, uncoordinated batch-collection mechanisms
         (one waiting a flat 1s for an album's remaining media_group_id
         messages, one debouncing individually-sent files with no
@@ -152,7 +159,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.7"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.8"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import logging
@@ -173,6 +180,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -788,7 +796,20 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
         lines.append(f"❌ Не удалось загрузить ({len(failed)}): {names}")
     if succeeded:
         lines.append(f"\nПапка (доступ на чтение всем, у кого есть ссылка):\n{link}")
-    await bot.send_message(chat_id, "\n".join(lines))
+
+    # v5.8: the link in the text above is already tappable (opens the
+    # folder), but Telegram's default tap gesture for a plain URL is
+    # "open", not "copy" — there's no way to long-press-copy it without
+    # first opening the browser. copy_text is a separate inline-button type
+    # (Bot API 7.x+) whose only job is "put this exact string on the
+    # clipboard when tapped", so we add it alongside the text link rather
+    # than instead of it — one tap to open, or one tap on the button to copy.
+    reply_markup = None
+    if succeeded:
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))],
+        ])
+    await bot.send_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
 
     # Delete original chat messages only for files that actually uploaded.
     deleted, not_deleted = 0, 0

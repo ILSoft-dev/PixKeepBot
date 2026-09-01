@@ -1,8 +1,19 @@
 """
 main.py
-v5.11 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.12 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.12: the upload flow used to always end with a routine "🗑 Удалил N
+        исходных сообщений из чата" text message AFTER the "✅ Загружено...
+        ссылка" report — so the link/report was never actually the last
+        thing visible in the chat. Deleting the original messages now just
+        runs under the same TYPING chat-action indicator as the rest of the
+        pipeline (v5.11) instead of narrating itself with its own message.
+        A text message only appears afterward if something genuinely needs
+        attention — a handful of messages Telegram wouldn't let get deleted
+        (e.g. too old) — since that's information the person has to act on,
+        not a routine confirmation. When everything deletes cleanly (the
+        normal case), the upload report stays the last word in the chat.
 - v5.11: moved the "still working" indicator (v5.9) out of the chat log and
         into Telegram's native chat-action line — the "бот отправляет
         файл..." text that shows right under the chat title, the same spot
@@ -204,7 +215,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.11"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.12"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -938,21 +949,31 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
 
     # Delete original chat messages only for files that actually uploaded.
-    deleted, not_deleted = 0, 0
-    for r in succeeded:
-        try:
-            await bot.delete_message(chat_id, r["message_id"])
-            deleted += 1
-        except Exception as e:
-            logging.warning(f"couldn't delete message {r['message_id']}: {e}")
-            not_deleted += 1
+    # v5.12: this used to always end with its own "🗑 Удалил N исходных
+    # сообщений" text message — meaning the link/report above was never
+    # actually the last thing in the chat, a routine housekeeping note
+    # always came after it. Deletion itself is quick, but wrapping it in
+    # the same chat-action indicator as the rest of the pipeline still
+    # gives *some* visible sign it's happening, without adding a message.
+    not_deleted = 0
+    async with _heartbeat(chat_id, action=ChatAction.TYPING):
+        for r in succeeded:
+            try:
+                await bot.delete_message(chat_id, r["message_id"])
+            except Exception as e:
+                logging.warning(f"couldn't delete message {r['message_id']}: {e}")
+                not_deleted += 1
 
-    if deleted or not_deleted:
-        note = f"🗑 Удалил {deleted} исходных сообщений из чата."
-        if not_deleted:
-            note += (f" Не смог удалить {not_deleted} — обычно если прошло "
-                     "слишком много времени, удали вручную при желании.")
-        await bot.send_message(chat_id, note)
+    # Only speak up here if something actually needs attention (a handful
+    # of messages Telegram wouldn't let us delete, e.g. too old) — that's
+    # real information the person has to act on, not a routine confirmation.
+    # When everything deleted cleanly, the report above stays the last word.
+    if not_deleted:
+        await bot.send_message(
+            chat_id,
+            f"🗑 Не смог удалить {not_deleted} исходных сообщени(й) из чата — "
+            "обычно если прошло слишком много времени, удали вручную при желании.",
+        )
 
     if work_dir and os.path.exists(work_dir):
         shutil.rmtree(work_dir, ignore_errors=True)

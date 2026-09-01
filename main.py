@@ -1,8 +1,20 @@
 """
 main.py
-v5.8 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
+v5.9 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.9: added a "heartbeat" — a background ping every 6s with a random
+        working-on-it phrase (see HEARTBEAT_MESSAGES) — wrapped around the
+        two stretches of the pipeline that can run long with literally
+        nothing printed to the chat: download-from-Telegram + exiftool
+        inspect/clean in _process, and the actual Drive upload in
+        _do_upload. Purely cosmetic/reassurance — the messages don't need
+        to (and don't) describe the exact operation running at that instant,
+        they just prove the bot hasn't silently died on a big or slow
+        batch. Implemented as an async context manager (_heartbeat) so it
+        starts/stops correctly via try/finally regardless of whether the
+        wrapped code finishes normally, raises, or (in principle) gets
+        cancelled — no separate bookkeeping needed at each call site.
 - v5.8: added a "📋 Скопировать ссылку" button under the final upload report,
         using Telegram's copy_text inline-button type (Bot API 7.x+,
         aiogram's CopyTextButton) — tapping it puts the Drive link straight
@@ -159,11 +171,13 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.8"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.9"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
+import contextlib
 import logging
 import os
+import random
 import shutil
 import uuid
 from collections import Counter
@@ -267,6 +281,49 @@ def _get_chat_lock(chat_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         chat_locks[chat_id] = lock
     return lock
+
+
+# v5.9: the chat goes quiet for the entire download+exif+clean stretch (right
+# after the "укажите имя папки"/auto-date note — those only get sent once
+# all of that has already finished) and again during the actual Drive
+# upload — both can take a while for a big batch, and with nothing printed
+# in between it's not obvious the bot is still doing anything rather than
+# stuck. This isn't meant to narrate the real step (that's what the
+# "Получил N файлов" / "Загружаю в папку..." messages already do) — it's
+# just proof of life, so the messages don't need to match what's actually
+# executing at that instant.
+HEARTBEAT_INTERVAL_SECONDS = 6.0
+HEARTBEAT_MESSAGES = [
+    "⚙️ Работаю, не отключайся...",
+    "📥 Разбираю файлы...",
+    "🧹 Копаюсь в метаданных...",
+    "📤 Ещё немного...",
+    "🔍 Почти готово...",
+    "⏳ Секунду...",
+]
+
+
+async def _heartbeat_loop(chat_id: int) -> None:
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            await bot.send_message(chat_id, random.choice(HEARTBEAT_MESSAGES))
+    except asyncio.CancelledError:
+        pass
+
+
+@contextlib.asynccontextmanager
+async def _heartbeat(chat_id: int):
+    """Wrap around any await that might run long and silent. Starts a
+    background task pinging the chat every HEARTBEAT_INTERVAL_SECONDS;
+    always cancelled on the way out, success or failure alike."""
+    task = asyncio.create_task(_heartbeat_loop(chat_id))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 class Flow(StatesGroup):
@@ -530,56 +587,58 @@ async def _process(messages: list[Message], state: FSMContext, chat_id: int):
     os.makedirs(work_dir, exist_ok=True)
 
     dl_sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+    exif_sem = asyncio.Semaphore(EXIF_CONCURRENCY)
 
     async def _download_bounded(msg: Message) -> str | None:
         async with dl_sem:
             return await _download(msg, work_dir)
 
-    paths = await asyncio.gather(*[_download_bounded(msg) for msg in messages])
-
-    items = []
-    for msg, path in zip(messages, paths):
-        if not path:
-            continue
-        items.append({
-            "message_id": msg.message_id,
-            "path": path,
-            "orig_name": os.path.basename(path),
-        })
-
-    if not items:
-        await bot.send_message(chat_id, "Не нашёл файлов для обработки.")
-        shutil.rmtree(work_dir, ignore_errors=True)
-        return
-
-    exif_sem = asyncio.Semaphore(EXIF_CONCURRENCY)
-
     async def _inspect(it: dict) -> dict:
         async with exif_sem:
             return await asyncio.to_thread(inspect_metadata, it["path"])
 
-    metas = await asyncio.gather(*[_inspect(it) for it in items])
-    gps_count = sum(1 for m in metas if m["has_gps"])
-    exif_dates = [d for d in (_parse_exif_date(m["datetime"]) for m in metas) if d]
+    async def _clean_one(it: dict, clean_dir: str) -> None:
+        out = os.path.join(clean_dir, it["orig_name"])
+        async with exif_sem:
+            try:
+                await asyncio.to_thread(strip_exif, it["path"], out)
+            except Exception as e:
+                logging.error(f"strip failed {it['path']}: {e}")
+                shutil.copy(it["path"], out)
+        it["upload_path"] = out
 
-    if settings["clean_metadata"]:
-        clean_dir = os.path.join(work_dir, "clean")
-        os.makedirs(clean_dir, exist_ok=True)
+    # v5.9: this is the long silent stretch — download from Telegram, run
+    # exiftool on every file, optionally re-write clean copies — with
+    # nothing printed to the chat until it's all done. Heartbeat covers it.
+    async with _heartbeat(chat_id):
+        paths = await asyncio.gather(*[_download_bounded(msg) for msg in messages])
 
-        async def _clean_one(it: dict) -> None:
-            out = os.path.join(clean_dir, it["orig_name"])
-            async with exif_sem:
-                try:
-                    await asyncio.to_thread(strip_exif, it["path"], out)
-                except Exception as e:
-                    logging.error(f"strip failed {it['path']}: {e}")
-                    shutil.copy(it["path"], out)
-            it["upload_path"] = out
+        items = []
+        for msg, path in zip(messages, paths):
+            if not path:
+                continue
+            items.append({
+                "message_id": msg.message_id,
+                "path": path,
+                "orig_name": os.path.basename(path),
+            })
 
-        await asyncio.gather(*[_clean_one(it) for it in items])
-    else:
-        for it in items:
-            it["upload_path"] = it["path"]
+        if not items:
+            await bot.send_message(chat_id, "Не нашёл файлов для обработки.")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return
+
+        metas = await asyncio.gather(*[_inspect(it) for it in items])
+        gps_count = sum(1 for m in metas if m["has_gps"])
+        exif_dates = [d for d in (_parse_exif_date(m["datetime"]) for m in metas) if d]
+
+        if settings["clean_metadata"]:
+            clean_dir = os.path.join(work_dir, "clean")
+            os.makedirs(clean_dir, exist_ok=True)
+            await asyncio.gather(*[_clean_one(it, clean_dir) for it in items])
+        else:
+            for it in items:
+                it["upload_path"] = it["path"]
 
     width = max(3, len(str(len(items))))
     for i, it in enumerate(items, start=1):
@@ -776,7 +835,8 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
     await bot.send_message(chat_id, f"Загружаю в папку «{folder_name}»...")
 
     try:
-        results, link = await _upload_all(account, items, folder_name)
+        async with _heartbeat(chat_id):
+            results, link = await _upload_all(account, items, folder_name)
     except Exception as e:
         logging.exception("upload failed")
         await bot.send_message(chat_id, f"Ошибка при загрузке: {e}")

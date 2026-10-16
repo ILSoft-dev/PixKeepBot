@@ -89,7 +89,25 @@ create table if not exists google_accounts (
   unique (telegram_id, email)
 );
 create index if not exists idx_google_accounts_telegram on google_accounts(telegram_id);
+
+-- v5.15: история загрузок для «📂 Мои загрузки»
+create table if not exists uploads (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  account_id bigint not null,
+  folder_id text not null,
+  folder_name text not null,
+  link text not null,
+  files jsonb not null default '[]',
+  shared boolean not null default true,
+  created_at timestamptz default now()
+);
+create index if not exists idx_uploads_telegram on uploads(telegram_id, created_at desc);
 ```
+
+**Если обновляешься с v5.14** — выполни только блок `create table ... uploads`
+выше ДО деплоя (без таблицы бот продолжит грузить, но «Мои загрузки» будут
+пустыми/с ошибкой).
 
 **Если у тебя уже есть `user_settings` без колонки `replace_duplicates`**
 (т.е. обновляешься на v5.10) — обязательно добавь её ДО деплоя новой версии

@@ -18,7 +18,19 @@ Tables (create once, SQL in README):
                     created_at timestamptz default now(),
                     unique (telegram_id, email))
 
+    uploads(id bigserial primary key,
+            telegram_id bigint not null,
+            account_id bigint not null,
+            folder_id text not null,
+            folder_name text not null,
+            link text not null,
+            files jsonb not null default '[]',
+            shared boolean not null default true,
+            created_at timestamptz default now())
+
 Changelog:
+- v5.5: "Мои загрузки" — uploads table + save/list/get/update/delete helpers,
+        get_account_by_id; logout also clears the user's uploads.
 - v5.4: keep_alive_loop() — periodic lightweight query so the free Supabase
         project is never auto-paused for inactivity (see main.py v5.14); 10 min interval, same as voice_bot.
 - v5.3: added replace_duplicates setting — when on, uploading a file whose
@@ -153,6 +165,81 @@ def update_account_tokens(account_id: int, access_token: str, refresh_token: str
 
 def remove_all_accounts(telegram_id: int) -> None:
     _supabase.table("google_accounts").delete().eq("telegram_id", telegram_id).execute()
+    _supabase.table("uploads").delete().eq("telegram_id", telegram_id).execute()
+
+
+def get_account_by_id(telegram_id: int, account_id: int) -> dict | None:
+    resp = (
+        _supabase.table("google_accounts")
+        .select("id, email, access_token, refresh_token")
+        .eq("telegram_id", telegram_id)
+        .eq("id", account_id)
+        .limit(1)
+        .execute()
+    )
+    return resp.data[0] if resp.data else None
+
+
+# ------------------------------------------------------------------ uploads --
+UPLOADS_KEEP = 20  # rows kept per user; older ones are pruned on insert
+
+
+def save_upload(telegram_id: int, account_id: int, folder_id: str,
+                folder_name: str, link: str, files: list[dict]) -> None:
+    """files: [{"id": drive_file_id, "name": uploaded_name}, ...]"""
+    _supabase.table("uploads").insert({
+        "telegram_id": telegram_id,
+        "account_id": account_id,
+        "folder_id": folder_id,
+        "folder_name": folder_name,
+        "link": link,
+        "files": files,
+    }).execute()
+    old = (
+        _supabase.table("uploads").select("id")
+        .eq("telegram_id", telegram_id)
+        .order("created_at", desc=True)
+        .range(UPLOADS_KEEP, UPLOADS_KEEP + 200)
+        .execute()
+    )
+    ids = [r["id"] for r in (old.data or [])]
+    if ids:
+        _supabase.table("uploads").delete().in_("id", ids).execute()
+
+
+def list_uploads(telegram_id: int, limit: int = 10) -> list[dict]:
+    resp = (
+        _supabase.table("uploads").select("*")
+        .eq("telegram_id", telegram_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return resp.data or []
+
+
+def get_upload(telegram_id: int, upload_id: int) -> dict | None:
+    resp = (
+        _supabase.table("uploads").select("*")
+        .eq("telegram_id", telegram_id).eq("id", upload_id)
+        .limit(1).execute()
+    )
+    return resp.data[0] if resp.data else None
+
+
+def update_upload(telegram_id: int, upload_id: int, **fields) -> None:
+    _supabase.table("uploads").update(fields).eq(
+        "telegram_id", telegram_id).eq("id", upload_id).execute()
+
+
+def delete_upload(telegram_id: int, upload_id: int) -> None:
+    _supabase.table("uploads").delete().eq(
+        "telegram_id", telegram_id).eq("id", upload_id).execute()
+
+
+def delete_uploads_by_folder(telegram_id: int, folder_id: str) -> None:
+    _supabase.table("uploads").delete().eq(
+        "telegram_id", telegram_id).eq("folder_id", folder_id).execute()
 
 
 # -------------------------------------------------------------- keep-alive ---

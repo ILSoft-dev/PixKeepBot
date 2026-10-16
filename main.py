@@ -3,6 +3,10 @@ main.py
 v5.13 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.15: "📂 Мои загрузки" (кнопка под полем ввода + /uploads): последние 10
+        загрузок, по каждой — открыть/скопировать ссылку, закрыть/открыть
+        доступ по ссылке, удалить (файлы и пустая папка уходят в корзину
+        Drive). REQUIRES table `uploads` in Supabase — SQL in README.
 - v5.14: Supabase keep-alive — background task (db.keep_alive_loop) pings the
         database every 10 min so the free project is not paused for inactivity.
 - v5.13: removed the TYPING chat-action v5.12 wrapped around message
@@ -225,7 +229,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.14"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.15"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -251,12 +255,21 @@ from aiogram.types import (
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from config import config
 from db import (
     keep_alive_loop,
+    get_account_by_id,
+    save_upload,
+    list_uploads,
+    get_upload,
+    update_upload,
+    delete_upload,
+    delete_uploads_by_folder,
     get_settings,
     set_setting,
     add_or_update_account,
@@ -274,6 +287,9 @@ from drive_utils import (
     replace_file_content,
     publish_and_get_url,
     GoogleAuthError,
+    trash_file,
+    folder_is_empty,
+    revoke_public_access,
 )
 from oauth import build_auth_url, exchange_code, refresh_access_token, get_user_email
 
@@ -423,11 +439,13 @@ async def start(message: Message):
             "/settings.\n\n"
             "⚠️ Присылай как файл (📎 → Файл), а не как обычное фото — иначе "
             "Telegram сам пережмёт изображение.\n\n"
+            "/uploads — последние загрузки (ссылки, удаление)\n"
             "/accounts — посмотреть все аккаунты и переключиться\n"
             "/settings — настройки очистки/переименования\n"
             "/logout — отключить все аккаунты.",
             reply_markup=kb,
         )
+        await message.answer("Меню внизу 👇", reply_markup=UPLOADS_KEYBOARD)
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -465,6 +483,221 @@ async def on_switch_account(cq: CallbackQuery):
     accounts = list_accounts(cq.from_user.id)
     await cq.message.edit_reply_markup(reply_markup=_accounts_keyboard(accounts))
     await cq.answer("Активный аккаунт изменён")
+
+
+# ------------------------------------------------------------ my uploads ----
+UPLOADS_BUTTON = "📂 Мои загрузки"
+UPLOADS_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=UPLOADS_BUTTON)]],
+    resize_keyboard=True, is_persistent=True,
+)
+
+
+def _fmt_dt(iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.astimezone(LOCAL_TZ).strftime("%d.%m %H:%M")
+    except Exception:
+        return "?"
+
+
+async def _with_drive(account: dict, fn):
+    """Runs `await fn(session, token)`; on a 401 refreshes the token once
+    (and stores it) and retries."""
+    async with aiohttp.ClientSession() as session:
+        try:
+            return await fn(session, account["access_token"])
+        except GoogleAuthError:
+            new = await refresh_access_token(account["refresh_token"])
+            update_account_tokens(account["id"], new["access_token"], new["refresh_token"])
+            account["access_token"] = new["access_token"]
+            return await fn(session, new["access_token"])
+
+
+def _uploads_list_view(uid: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    rows = list_uploads(uid, 10)
+    if not rows:
+        return "Загрузок пока нет.", None
+    kb = [[InlineKeyboardButton(
+        text=f"{_fmt_dt(r['created_at'])} · {r['folder_name']} · {len(r['files'])} ф.",
+        callback_data=f"up:{r['id']}",
+    )] for r in rows]
+    return "📂 Последние загрузки — выбери:", InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def _upload_detail_view(u: dict) -> tuple[str, InlineKeyboardMarkup]:
+    names = [f["name"] for f in u["files"]]
+    shown = ", ".join(names[:15]) + (f" … и ещё {len(names) - 15}" if len(names) > 15 else "")
+    access = ("🔓 доступ по ссылке открыт" if u.get("shared", True)
+              else "🔒 доступ по ссылке закрыт")
+    text = (
+        f"📁 {u['folder_name']}\n{_fmt_dt(u['created_at'])} · файлов: {len(names)}\n"
+        f"{access}\n\nФайлы: {shown}\n\n{u['link']}"
+    )
+    uid = u["id"]
+    kb = []
+    if u.get("shared", True):
+        kb.append([InlineKeyboardButton(text="🔗 Открыть папку", url=u["link"])])
+        kb.append([InlineKeyboardButton(text="📋 Скопировать ссылку",
+                                        copy_text=CopyTextButton(text=u["link"]))])
+        kb.append([InlineKeyboardButton(text="🔒 Закрыть доступ по ссылке",
+                                        callback_data=f"upun:{uid}")])
+    else:
+        kb.append([InlineKeyboardButton(text="🔓 Открыть доступ по ссылке",
+                                        callback_data=f"upsh:{uid}")])
+    kb.append([InlineKeyboardButton(text="🗑 Удалить загрузку", callback_data=f"updel:{uid}")])
+    kb.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="uplist")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+async def _send_uploads(message: Message):
+    text, kb = _uploads_list_view(message.from_user.id)
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("uploads"))
+async def uploads_cmd(message: Message):
+    await _send_uploads(message)
+
+
+@dp.message(F.text == UPLOADS_BUTTON)
+async def uploads_button(message: Message):
+    await _send_uploads(message)
+
+
+@dp.callback_query(F.data == "uplist")
+async def on_uploads_list(cq: CallbackQuery):
+    text, kb = _uploads_list_view(cq.from_user.id)
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^up:\d+$"))
+async def on_upload_open(cq: CallbackQuery):
+    u = get_upload(cq.from_user.id, int(cq.data.split(":")[1]))
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    text, kb = _upload_detail_view(u)
+    await cq.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await cq.answer()
+
+
+async def _account_for(cq: CallbackQuery, u: dict) -> dict | None:
+    account = get_account_by_id(cq.from_user.id, u["account_id"])
+    if not account:
+        await cq.answer("Аккаунт этой загрузки больше не подключён", show_alert=True)
+    return account
+
+
+@dp.callback_query(F.data.regexp(r"^up(un|sh):\d+$"))
+async def on_upload_share_toggle(cq: CallbackQuery):
+    action, raw_id = cq.data.split(":")
+    u = get_upload(cq.from_user.id, int(raw_id))
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    account = await _account_for(cq, u)
+    if not account:
+        return
+    try:
+        if action == "upun":
+            await _with_drive(account, lambda s, t: revoke_public_access(s, t, u["folder_id"]))
+            update_upload(cq.from_user.id, u["id"], shared=False)
+            u["shared"] = False
+            note = "Доступ по ссылке закрыт"
+        else:
+            await _with_drive(account, lambda s, t: publish_and_get_url(s, t, u["folder_id"]))
+            update_upload(cq.from_user.id, u["id"], shared=True)
+            u["shared"] = True
+            note = "Доступ по ссылке открыт"
+    except Exception as e:
+        logging.exception("share toggle failed")
+        await cq.answer(f"Ошибка: {e}"[:190], show_alert=True)
+        return
+    text, kb = _upload_detail_view(u)
+    await cq.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await cq.answer(note)
+
+
+@dp.callback_query(F.data.regexp(r"^updel:\d+$"))
+async def on_upload_delete_ask(cq: CallbackQuery):
+    uid = int(cq.data.split(":")[1])
+    u = get_upload(cq.from_user.id, uid)
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"updelok:{uid}")],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"up:{uid}")],
+    ])
+    await cq.message.edit_text(
+        f"Удалить {len(u['files'])} файл(ов) из папки «{u['folder_name']}»?\n"
+        "Они уйдут в корзину Google Диска (там их можно восстановить в течение "
+        "30 дней). Если папка опустеет, она тоже уйдёт в корзину.",
+        reply_markup=kb,
+    )
+    await cq.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^updelok:\d+$"))
+async def on_upload_delete_do(cq: CallbackQuery):
+    uid = int(cq.data.split(":")[1])
+    tg = cq.from_user.id
+    u = get_upload(tg, uid)
+    if not u:
+        await cq.answer("Загрузка не найдена", show_alert=True)
+        return
+    account = await _account_for(cq, u)
+    if not account:
+        return
+    await cq.message.edit_text("Удаляю…")
+
+    sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+    failed: list[dict] = []
+
+    async def _one(session, token, f):
+        async with sem:
+            try:
+                await trash_file(session, token, f["id"])
+            except GoogleAuthError:
+                raise
+            except Exception as e:
+                logging.error(f"trash failed for {f['name']}: {e}")
+                failed.append(f)
+
+    async def _all(session, token):
+        failed.clear()
+        await asyncio.gather(*[_one(session, token, f) for f in u["files"]])
+        folder_gone = False
+        if not failed and await folder_is_empty(session, token, u["folder_id"]):
+            await trash_file(session, token, u["folder_id"])
+            folder_gone = True
+        return folder_gone
+
+    try:
+        folder_gone = await _with_drive(account, _all)
+    except Exception as e:
+        logging.exception("delete upload failed")
+        await cq.message.edit_text(f"Ошибка при удалении: {e}")
+        return
+
+    if failed:
+        update_upload(tg, uid, files=failed)
+        await cq.message.edit_text(
+            f"Удалено {len(u['files']) - len(failed)}, не удалось: "
+            f"{', '.join(f['name'] for f in failed)}.\nМожно повторить из списка /uploads."
+        )
+        return
+    if folder_gone:
+        delete_uploads_by_folder(tg, u["folder_id"])
+    else:
+        delete_upload(tg, uid)
+    await cq.message.edit_text(
+        "🗑 Удалено (в корзине Google Диска)."
+        + (" Папка тоже." if folder_gone else " Папка осталась — в ней есть другие файлы.")
+    )
+    await cq.answer()
 
 
 @dp.message(Command("logout"))
@@ -818,7 +1051,7 @@ UPLOAD_CONCURRENCY = 4
 
 
 async def _upload_all(account: dict, items: list[dict], folder_name: str,
-                      replace_duplicates: bool = False) -> tuple[list[dict], str]:
+                      replace_duplicates: bool = False) -> tuple[list[dict], str, str]:
     """Upload every item to the user's Google Drive folder, concurrently
     (bounded by UPLOAD_CONCURRENCY). Continues past individual file
     failures (records them, doesn't abort).
@@ -864,7 +1097,7 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
             access_token = await refresh_once()
             folder_id = await ensure_folder(session, access_token, folder_name)
 
-        async def _put_one(token: str, it: dict) -> None:
+        async def _put_one(token: str, it: dict) -> str:
             """Does the actual create-or-replace for one item, given a
             known-good token. Raises on failure so both call sites below
             (first try / after-refresh retry) can handle it the same way."""
@@ -875,16 +1108,16 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
                 )
             if existing_id:
                 await replace_file_content(session, token, it["upload_path"], existing_id)
-            else:
-                await upload_file(
-                    session, token, it["upload_path"], folder_id, it["upload_name"],
-                )
+                return existing_id
+            return await upload_file(
+                session, token, it["upload_path"], folder_id, it["upload_name"],
+            )
 
         async def _upload_one(index: int, it: dict) -> None:
             async with sem:
                 try:
-                    await _put_one(access_token, it)
-                    results[index] = {**it, "success": True, "error": None}
+                    fid = await _put_one(access_token, it)
+                    results[index] = {**it, "success": True, "error": None, "file_id": fid}
                     return
                 except GoogleAuthError:
                     pass  # fall through to a single refresh-and-retry below
@@ -895,8 +1128,8 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
 
                 try:
                     token = await refresh_once()
-                    await _put_one(token, it)
-                    results[index] = {**it, "success": True, "error": None}
+                    fid = await _put_one(token, it)
+                    results[index] = {**it, "success": True, "error": None, "file_id": fid}
                 except Exception as e:
                     logging.error(f"upload failed for {it['upload_name']} after refresh: {e}")
                     results[index] = {**it, "success": False, "error": str(e)}
@@ -904,7 +1137,7 @@ async def _upload_all(account: dict, items: list[dict], folder_name: str,
         await asyncio.gather(*[_upload_one(i, it) for i, it in enumerate(items)])
 
         url = await publish_and_get_url(session, access_token, folder_id)
-    return results, url
+    return results, url, folder_id
 
 
 async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
@@ -924,7 +1157,7 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
     replace_duplicates = get_settings(telegram_id)["replace_duplicates"]
     try:
         async with _heartbeat(chat_id):
-            results, link = await _upload_all(account, items, folder_name, replace_duplicates)
+            results, link, folder_id = await _upload_all(account, items, folder_name, replace_duplicates)
     except Exception as e:
         logging.exception("upload failed")
         await bot.send_message(chat_id, f"Ошибка при загрузке: {e}")
@@ -958,6 +1191,15 @@ async def _do_upload(chat_id: int, telegram_id: int, items: list[dict],
             [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))],
         ])
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
+
+    if succeeded:
+        try:
+            save_upload(
+                telegram_id, account["id"], folder_id, folder_name.strip(), link,
+                [{"id": r["file_id"], "name": r["upload_name"]} for r in succeeded],
+            )
+        except Exception:
+            logging.exception("couldn't record upload in history")
 
     # Delete original chat messages only for files that actually uploaded.
     # v5.13: v5.12 wrapped this in the TYPING chat-action to give some sign
@@ -1056,6 +1298,7 @@ async def run_web():
 
 BOT_COMMANDS = [
     BotCommand(command="start", description="Подключить Диск / статус"),
+    BotCommand(command="uploads", description="Мои загрузки: ссылки и удаление"),
     BotCommand(command="accounts", description="Аккаунты: список и переключение"),
     BotCommand(command="settings", description="Настройки очистки и переименования"),
     BotCommand(command="logout", description="Отключить все аккаунты"),

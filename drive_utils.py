@@ -9,6 +9,8 @@ API docs: https://developers.google.com/workspace/drive/api/reference/rest/v3
 Auth header format: `Authorization: Bearer <token>`.
 
 Changelog:
+- v4.2: upload_file now returns the new file's id; added trash_file,
+        folder_is_empty, revoke_public_access (for "Мои загрузки").
 - v4.1: added find_file_in_folder + replace_file_content, for the
         replace_duplicates setting — lets main.py overwrite an existing
         same-named file in place instead of always creating a new one via
@@ -74,7 +76,7 @@ async def ensure_folder(session: aiohttp.ClientSession, token: str,
 
 
 async def upload_file(session: aiohttp.ClientSession, token: str,
-                      local_path: str, folder_id: str, name: str) -> None:
+                      local_path: str, folder_id: str, name: str) -> str:
     """Multipart upload of a single (modest-size) file into folder_id.
     Always creates a NEW file, even if one with this name already exists
     in folder_id — see find_file_in_folder/replace_file_content below for
@@ -91,10 +93,11 @@ async def upload_file(session: aiohttp.ClientSession, token: str,
     form.add_field("file", file_bytes, content_type="application/octet-stream")
 
     async with session.post(
-        f"{UPLOAD_API}/files", params={"uploadType": "multipart"},
+        f"{UPLOAD_API}/files", params={"uploadType": "multipart", "fields": "id"},
         data=form, headers=_headers(token),
     ) as resp:
         await _check(resp, ok=(200, 201))
+        return (await resp.json())["id"]
 
 
 async def find_file_in_folder(session: aiohttp.ClientSession, token: str,
@@ -144,3 +147,46 @@ async def publish_and_get_url(session: aiohttp.ClientSession, token: str,
         await _check(resp, ok=(200, 201))
 
     return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+async def trash_file(session: aiohttp.ClientSession, token: str,
+                     file_id: str) -> None:
+    """Moves a file/folder to the Drive trash (recoverable for 30 days).
+    Already gone (404) counts as success."""
+    async with session.patch(
+        f"{API}/files/{file_id}", json={"trashed": True}, headers=_headers(token),
+    ) as resp:
+        if resp.status == 404:
+            return
+        await _check(resp, ok=(200,))
+
+
+async def folder_is_empty(session: aiohttp.ClientSession, token: str,
+                          folder_id: str) -> bool:
+    query = f"'{folder_id}' in parents and trashed=false"
+    async with session.get(
+        f"{API}/files", params={"q": query, "fields": "files(id)", "pageSize": 1},
+        headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
+        data = await resp.json()
+    return not data.get("files")
+
+
+async def revoke_public_access(session: aiohttp.ClientSession, token: str,
+                               folder_id: str) -> None:
+    """Removes the 'anyone with the link' permission from the folder."""
+    async with session.get(
+        f"{API}/files/{folder_id}/permissions",
+        params={"fields": "permissions(id,type)"}, headers=_headers(token),
+    ) as resp:
+        await _check(resp, ok=(200,))
+        data = await resp.json()
+    for p in data.get("permissions", []):
+        if p.get("type") == "anyone":
+            async with session.delete(
+                f"{API}/files/{folder_id}/permissions/{p['id']}",
+                headers=_headers(token),
+            ) as resp:
+                if resp.status != 404:
+                    await _check(resp, ok=(200, 204))

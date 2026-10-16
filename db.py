@@ -19,6 +19,8 @@ Tables (create once, SQL in README):
                     unique (telegram_id, email))
 
 Changelog:
+- v5.4: keep_alive_loop() — periodic lightweight query so the free Supabase
+        project is never auto-paused for inactivity (see main.py v5.14); 10 min interval, same as voice_bot.
 - v5.3: added replace_duplicates setting — when on, uploading a file whose
         name already exists in the target Drive folder overwrites that
         file in place instead of leaving a second copy with the same name
@@ -42,6 +44,9 @@ Changelog:
 - v4.1: single-account disk_users table (access_token/refresh_token +
         clean_metadata/anonymize_names all in one row per telegram_id).
 """
+import asyncio
+import logging
+
 from supabase import create_client
 
 from config import config
@@ -148,3 +153,27 @@ def update_account_tokens(account_id: int, access_token: str, refresh_token: str
 
 def remove_all_accounts(telegram_id: int) -> None:
     _supabase.table("google_accounts").delete().eq("telegram_id", telegram_id).execute()
+
+
+# -------------------------------------------------------------- keep-alive ---
+# Free Supabase projects are paused after ~7 days without activity. A cheap
+# request every 10 minutes keeps the project "active".
+KEEPALIVE_INTERVAL_SECONDS = 10 * 60
+
+
+def _ping_sync() -> None:
+    _supabase.table("user_settings").select("telegram_id").limit(1).execute()
+
+
+async def keep_alive_loop(interval: int = KEEPALIVE_INTERVAL_SECONDS) -> None:
+    """Background task: ping Supabase right away, then every `interval` seconds.
+    Errors are logged and never stop the loop; cancellation exits cleanly."""
+    while True:
+        try:
+            await asyncio.to_thread(_ping_sync)
+            logging.debug("Supabase keep-alive: ok")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.warning(f"Supabase keep-alive failed: {e}")
+        await asyncio.sleep(interval)

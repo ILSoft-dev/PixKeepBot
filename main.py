@@ -3,6 +3,8 @@ main.py
 v5.13 - CleanDrive Bot (multi-user, multi-account, Google Drive backend, admin-only)
 
 Changelog:
+- v5.14: Supabase keep-alive — background task (db.keep_alive_loop) pings the
+        database every 10 min so the free project is not paused for inactivity.
 - v5.13: removed the TYPING chat-action v5.12 wrapped around message
         deletion. There's no "done" chat-action to end on (Bot API's
         action vocabulary is entirely in-progress states — typing,
@@ -223,7 +225,7 @@ continue on error) -> report + public link -> delete succeeded messages.
 
 Runs an aiohttp server (OAuth callback + Render port) alongside aiogram polling.
 """
-VERSION = "5.13"  # bump on every change; check via /version to confirm what's actually deployed
+VERSION = "5.14"  # bump on every change; check via /version to confirm what's actually deployed
 
 import asyncio
 import contextlib
@@ -254,6 +256,7 @@ from aiogram.types import (
 
 from config import config
 from db import (
+    keep_alive_loop,
     get_settings,
     set_setting,
     add_or_update_account,
@@ -1064,7 +1067,12 @@ async def main():
     os.makedirs(config.TEMP_DIR, exist_ok=True)
     await bot.set_my_commands(BOT_COMMANDS)
     await run_web()
-    await dp.start_polling(bot)
+    keepalive_task = asyncio.create_task(keep_alive_loop())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        keepalive_task.cancel()
+        await asyncio.gather(keepalive_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
